@@ -1,0 +1,6 @@
+# vscode setting
+.vscode
+
+# Example project files
+sdkconfig.old
+build/
