@@ -9,7 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
-
+#include "driver/gpio.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
@@ -17,15 +17,25 @@
 #include "esp_wifi.h"
 #include "esp_smartconfig.h"
 #include "smartconfig_ack.h"
+#include "mqtt_client.h"
+#include "cJSON.h"
 #include "esp_log.h"
 
+#include "device.h"
+
 #define ESP_SMARTCOFNIG_TYPE CONFIG_ESP_SMARTCONFIG_TYPE
+
+#define GPIO_OUTPUT_IO_SWITCH_CTRL    0
+#define GPIO_OUTPUT_IO_WIFI_STATUS    2
+#define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_IO_SWITCH_CTRL) | (1ULL<<GPIO_OUTPUT_IO_WIFI_STATUS))
 
 static EventGroupHandle_t s_wifi_event_group;
 static const int CONNECTED_BIT = BIT0;
 static const int ESPTOUCH_DONE_BIT = BIT1;
 
 static const char *TAG = "APP";
+
+static struct device switch_dev;
 
 static void smartconfig_task(void* parm)
 {
@@ -106,8 +116,8 @@ fail:
 	return ret;
 }
 
-static void event_handler(void* arg, esp_event_base_t event_base,
-                                int32_t event_id, void *event_data)
+static void event_handler(void* arg, esp_event_base_t event_base, 
+			  int32_t event_id, void *event_data)
 {
 	smartconfig_event_got_ssid_pswd_t *evt;
 	wifi_config_t wifi_config;
@@ -125,7 +135,9 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 		esp_wifi_connect();
 		xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
 	} else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-		/* TODO: 打开WiFi指示灯, 控制gpio1 = 0*/
+		/* turning on the status light after wifi connection */
+		gpio_set_level(GPIO_OUTPUT_IO_WIFI_STATUS, 0);
+
 		ip_event_got_ip_t *event = (ip_event_got_ip_t*) event_data;
 		ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa(&event->ip_info.ip));
 		xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
@@ -160,7 +172,7 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 	}
 }
 
-static void wifi_init_sta(void)
+static void initialise_wifi(void)
 {
 	wifi_config_t config;
 	bool isget = false;
@@ -196,6 +208,131 @@ static void wifi_init_sta(void)
 	}
 }
 
+static void initialise_gpio(void)
+{
+	gpio_config_t io_conf;
+	//disable interrupt
+	io_conf.intr_type = GPIO_INTR_DISABLE;
+	//set as output mode
+	io_conf.mode = GPIO_MODE_OUTPUT;
+	//bit mask of the pins that you want to set,e.g.GPIO15/16
+	io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
+	//disable pull-down mode
+	io_conf.pull_down_en = 0;
+	//disable pull-up mode
+	io_conf.pull_up_en = 0;
+	//configure GPIO with the given settings
+	gpio_config(&io_conf);
+}
+
+static int mqtt_event_data_handler(void *data, int len)
+{
+	char *value = strndup(data, len);
+	if (!value)
+		return -1;
+
+	cJSON *pJsonRoot = cJSON_Parse(value);
+	if (pJsonRoot == NULL) {
+		free(value);
+		return -1;
+	}
+
+	cJSON *type = cJSON_GetObjectItem(pJsonRoot, "Type");
+	cJSON *devId = cJSON_GetObjectItem(pJsonRoot, "DevId");
+	char *type_str = cJSON_GetStringValue(type);
+	char *devId_str = cJSON_GetStringValue(devId);
+
+	if (strcmp(type_str, "switch") == 0 && strcmp(devId_str, switch_dev.dev_id) == 0) {
+		char *status = cJSON_GetStringValue(cJSON_GetObjectItem(pJsonRoot, "Status"));
+		if (strcmp(status, "on") == 0)
+			gpio_set_level(GPIO_OUTPUT_IO_SWITCH_CTRL, 0);
+		if (strcmp(status, "off") == 0)
+			gpio_set_level(GPIO_OUTPUT_IO_SWITCH_CTRL, 1);
+
+	}
+
+	cJSON_Delete(pJsonRoot);
+	free(value);
+	return 0;
+}
+
+static uint32_t get_chip_id(void)
+{
+	uint32_t chip_id;
+	chip_id = (REG_READ(0x3FF00050) & 0xFF000000) | (REG_READ(0x3ff00054) & 0xFFFFFF);
+	return chip_id;
+}
+
+static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
+{
+	esp_mqtt_client_handle_t client = event->client;
+	int msg_id;
+
+	switch (event->event_id) {
+	case MQTT_EVENT_CONNECTED:
+		ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+
+		switch_dev.type = "switch",
+		snprintf(switch_dev.dev_id, sizeof(switch_dev.dev_id), "%02X", get_chip_id());
+
+		if (register_device(client, &switch_dev) < 0)
+			break;
+
+		msg_id = esp_mqtt_client_subscribe(client, "/topic/switch", 1);
+		ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+
+		break;
+	case MQTT_EVENT_DISCONNECTED:
+		ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+		break;
+	case MQTT_EVENT_SUBSCRIBED:
+		ESP_LOGI(TAG, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
+		msg_id = esp_mqtt_client_publish(client, "/topic/qos0", "data", 0, 0, 0);
+		ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
+		break;
+	case MQTT_EVENT_UNSUBSCRIBED:
+		ESP_LOGI(TAG, "MQTT_EVENT_UNSUBSCRIBED, msg_id=%d", event->msg_id);
+		break;
+	case MQTT_EVENT_PUBLISHED:
+		ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d", event->msg_id);
+		break;
+	case MQTT_EVENT_DATA:
+		ESP_LOGI(TAG, "MQTT_EVENT_DATA");
+
+		char *topic = strndup(event->topic, event->topic_len);
+		if (strcmp(topic, "/topic/switch") == 0) {
+			mqtt_event_data_handler(event->data, event->data_len);
+		}
+		free(topic);
+		break;
+	case MQTT_EVENT_ERROR:
+		ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
+		break;
+	default:
+		ESP_LOGI(TAG, "Other event id:%d", event->event_id);
+		break;
+	}
+	return ESP_OK;
+}
+
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+	ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%d", base, event_id);
+	mqtt_event_handler_cb(event_data);
+}
+
+void initialise_mqtt(void)
+{
+	esp_mqtt_client_config_t mqtt_cfg = {
+		.uri = "mqtt://192.168.50.100",
+	};
+
+	esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+	esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, client);
+	esp_mqtt_client_start(client);
+}
+
 void app_main(void)
 {
 	ESP_LOGI(TAG, "Startup..");
@@ -209,6 +346,8 @@ void app_main(void)
 		 (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
 	ESP_LOGI(TAG, "free memory: %d kB", esp_get_free_heap_size() / 1024);
 
+	printf("ESP8266	chip	ID:0x%x\n", get_chip_id());
+
 	/* Initialize NVS */
 	esp_err_t ret = nvs_flash_init();
 	if (ret == ESP_ERR_NVS_NO_FREE_PAGES) {
@@ -217,8 +356,11 @@ void app_main(void)
 	}
 	ESP_ERROR_CHECK(ret);
 
+	initialise_gpio();
 
+	initialise_wifi();
+
+	initialise_mqtt();
 
 	//xTaskCreate(wifi_init_sta, "wifi_init_sta", 1024 * 10, NULL, 2, NULL);
-	wifi_init_sta();
 }
