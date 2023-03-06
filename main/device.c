@@ -9,7 +9,6 @@
 
 int register_device(esp_mqtt_client_handle_t client, struct device *dev)
 {
-	uint32_t devId;
 	char *data;
 	cJSON *root;
 
